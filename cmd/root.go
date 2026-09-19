@@ -1,0 +1,139 @@
+// Package cmd implements the talos-fuse CLI commands.
+package cmd
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/spf13/cobra"
+
+	"github.com/jgarr/talos-fuse/internal/fs"
+	"github.com/jgarr/talos-fuse/internal/talos"
+)
+
+// RunE is the cobra RunE function for the root command. It wires the
+// CLI flags into a talos.Repository, builds the FUSE adapter and
+// blocks in fs.Mount until the filesystem is unmounted.
+func RunE(cmd *cobra.Command, _ []string) error {
+	mountpoint, err := cmd.Flags().GetString("mount")
+	if err != nil {
+		return err
+	}
+
+	nodes, err := cmd.Flags().GetStringSlice("nodes")
+	if err != nil {
+		return err
+	}
+
+	endpoints, err := cmd.Flags().GetStringSlice("endpoints")
+	if err != nil {
+		return err
+	}
+
+	talosconfig, err := cmd.Flags().GetString("talosconfig")
+	if err != nil {
+		return err
+	}
+
+	contextName, err := cmd.Flags().GetString("context")
+	if err != nil {
+		return err
+	}
+
+	cluster, err := cmd.Flags().GetString("cluster")
+	if err != nil {
+		return err
+	}
+
+	maintenance, err := cmd.Flags().GetBool("maintenance")
+	if err != nil {
+		return err
+	}
+
+	syncFlag, err := cmd.Flags().GetBool("sync")
+	if err != nil {
+		return err
+	}
+
+	format, err := cmd.Flags().GetString("format")
+	if err != nil {
+		return err
+	}
+
+	format = strings.ToLower(format)
+	switch format {
+	case "yaml", "json":
+		// valid
+	default:
+		return fmt.Errorf("invalid --format %q: must be \"yaml\" or \"json\"", format)
+	}
+
+	debug, err := cmd.Flags().GetBool("debug")
+	if err != nil {
+		return err
+	}
+
+	repo := talos.NewRepository(maintenance, nodes, endpoints)
+
+	effectiveNodes, err := repo.ResolveNodes(talosconfig, contextName)
+	if err != nil {
+		return err
+	}
+
+	adapter := &fs.RepositoryAdapter{
+		Repo:        repo,
+		Talosconfig: talosconfig,
+		ContextName: contextName,
+		Cluster:     cluster,
+	}
+
+	fuseOpts := &fs.Options{
+		Repository:  adapter,
+		Maintenance: maintenance,
+		Writeable:   syncFlag && !maintenance,
+		Format:      format,
+		Nodes:       effectiveNodes,
+		MountOptions: fuse.MountOptions{
+			Name:  "talos-fuse",
+			Debug: debug,
+		},
+	}
+
+	server, err := fs.Mount(mountpoint, &fs.TalosRoot{}, fuseOpts)
+	if err != nil {
+		return err
+	}
+
+	server.Wait()
+	return nil
+}
+
+var rootCmd = &cobra.Command{
+	Use:   "talos-fuse",
+	Short: "Expose Talos API resources as a FUSE filesystem",
+	Long: `talos-fuse mounts a FUSE filesystem that mirrors Talos API resources.
+
+Resources are addressed by (namespace, type, id) and rendered as YAML by
+default. Use --format json for JSON output and --sync to push modifications
+back via the COSI resource API.`,
+	RunE: RunE,
+}
+
+// Execute runs the root command.
+func Execute() error {
+	return rootCmd.Execute()
+}
+
+func init() {
+	rootCmd.Flags().StringP("mount", "m", "./", "mount point path")
+	rootCmd.Flags().StringSliceP("nodes", "n", nil, "target nodes (comma-separated)")
+	rootCmd.Flags().StringSliceP("endpoints", "e", nil, "override endpoints (comma-separated)")
+	rootCmd.Flags().String("talosconfig", "", "talosconfig path")
+	rootCmd.Flags().String("context", "", "talosconfig context")
+	rootCmd.Flags().String("cluster", "", "cluster name")
+	rootCmd.Flags().BoolP("maintenance", "i", false, "connect in maintenance mode (insecure TLS)")
+	rootCmd.Flags().BoolP("sync", "s", false, "enable two-way sync (resource writes)")
+	rootCmd.Flags().String("format", "yaml", "file format: yaml or json")
+	rootCmd.Flags().Bool("debug", false, "enable FUSE debug logging")
+}
