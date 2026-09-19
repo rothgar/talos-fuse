@@ -50,12 +50,17 @@ func (r *Repository) Endpoints() []string { return r.endpoints }
 // In maintenance mode no talosconfig is consulted: a TLS config with
 // InsecureSkipVerify is built (matching `talosctl --insecure`), the
 // provided endpoints come from nodes (or the explicit endpoints
-// override), and WithEndpoints wires them up.
+// override), and WithEndpoints wires them up. client.WithNodes is
+// applied so a single call fans out across every configured node.
 //
 // In normal mode talosconfig is opened via clientconfig.Open and the
 // selected context feeds client.WithConfig. contextName, cluster, and
-// endpoints are applied via the matching With* options. The repository's
-// configured nodes (if any) are injected with client.WithNodes.
+// endpoints are applied via the matching With* options. client.WithNodes
+// is NOT applied here: against the Omni Sidero proxy the single
+// configured endpoint refuses to fan out to multiple nodes
+// ("one-2-many proxying is not supported" for /cosi.resource.State/List
+// and similar methods). Per-node scoping is performed at the call site
+// via client.WithNode.
 //
 // The client is always closed before WithClient returns, even when
 // action returns an error.
@@ -70,14 +75,16 @@ func (r *Repository) WithClient(
 	}
 	defer func() { _ = c.Close() }()
 
-	nodes, err := r.effectiveNodes(talosconfig, contextName)
-	if err != nil {
-		return err
+	if r.maintenance {
+		nodes, err := r.effectiveNodes(talosconfig, contextName)
+		if err != nil {
+			return err
+		}
+		if len(nodes) == 0 {
+			return fmt.Errorf("no nodes configured: pass --nodes or set nodes in talosconfig context %q", contextNameOrDefault(contextName))
+		}
+		ctx = client.WithNodes(ctx, nodes...)
 	}
-	if len(nodes) == 0 {
-		return fmt.Errorf("no nodes configured: pass --nodes or set nodes in talosconfig context %q", contextNameOrDefault(contextName))
-	}
-	ctx = client.WithNodes(ctx, nodes...)
 
 	return action(ctx, c)
 }
@@ -126,7 +133,7 @@ func (r *Repository) newClient(
 	opts := []client.OptionFunc{
 		client.WithConfig(cfg),
 		client.WithDefaultGRPCDialOptions(),
-		client.WithSideroV1KeysDir(""),
+		client.WithSideroV1KeysDir(clientconfig.CustomSideroV1KeysDirPath("")),
 	}
 	if contextName != "" {
 		opts = append(opts, client.WithContextName(contextName))
