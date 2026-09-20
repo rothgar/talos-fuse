@@ -5,20 +5,28 @@ addressed by `(namespace, type, id)` and rendered as files. The mount is
 read-only by default; with `--sync`, modifications to resource files are
 parsed and pushed back through the COSI resource API.
 
-## Build
+## Installation
+
+### Homebrew
+
+```sh
+brew tap rothgar/tap
+brew install talos-fuse
+```
+
+### Build from source
 
 ```sh
 go build ./...
 ```
 
-The resulting binary lives at `./talos-fuse`.
+The resulting binary is `./talos-fuse`.
 
 ## Usage
 
-### Normal mode
+### Single node
 
-Mount a single-node filesystem against a Talos node referenced in your
-`talosconfig`:
+Mount against a node referenced in your `talosconfig`:
 
 ```sh
 talos-fuse \
@@ -28,25 +36,75 @@ talos-fuse \
   --mount ./mnt
 ```
 
-The mount point will expose:
+The filesystem uses a `nodes/<hostname>/` layout regardless of how many
+nodes are targeted. Node UUIDs are resolved to hostnames automatically; if
+resolution fails the UUID is used instead:
+
+```
+mnt/
+  nodes/
+    my-node/
+      default/
+        linkstatuses/
+          eth0.yaml
+          eth1.yaml
+        ...
+      cluster/
+        memberstatuses/
+          my-node.yaml
+        ...
+      network/
+        ...
+```
+
+### Multi-node
+
+Pass multiple nodes via repeated or comma-separated `--nodes`. Each node
+gets its own directory under `nodes/`:
+
+```sh
+talos-fuse \
+  --talosconfig $HOME/.talos/config \
+  --context my-cluster \
+  --nodes node-a,node-b,node-c \
+  --mount ./mnt
+```
 
 ```
 mnt/
   nodes/
     node-a/
-      default/
-        linksstatus/
-          eth0.yaml
-        ...
-      cluster/
-        memberstatuses/
-          ...
+      ...
+    node-b/
+      ...
+    node-c/
+      ...
 ```
+
+### Omni-managed clusters
+
+For clusters managed by Omni, supply the cluster name via `--cluster`.
+The context's `cluster:` field is used for request routing through the
+Omni proxy; you do not need to supply `--nodes` separately when the
+cluster nodes are enumerated through Omni:
+
+```sh
+talos-fuse \
+  --talosconfig $HOME/.talos/config \
+  --context omni-context \
+  --cluster my-omni-cluster \
+  --nodes 10.0.0.1,10.0.0.2 \
+  --mount ./mnt
+```
+
+`--sync` is blocked for Omni-managed clusters because Omni reconciles
+machine config through its own patch system; direct COSI writes would be
+silently reverted on the next reconcile cycle.
 
 ### Maintenance mode
 
-Maintenance mode uses insecure TLS to connect to a node that has booted
-without an identity. The filesystem is always read-only in this mode:
+Maintenance mode uses insecure TLS to connect to a node that has not yet
+been provisioned. The filesystem is always read-only in this mode:
 
 ```sh
 talos-fuse \
@@ -56,58 +114,60 @@ talos-fuse \
   --mount ./mnt
 ```
 
-## Multi-node layout
+### Write-back (--sync)
 
-The filesystem always uses a `/nodes/<node>/` intermediate directory,
-regardless of how many nodes are targeted. With a single node the layout
-is:
+With `--sync`, writing a modified YAML or JSON file back to the filesystem
+pushes the change through the COSI resource API:
 
-```
-mnt/
-  nodes/
-    node-a/
-      default/
-        linksstatus/
-          eth0.yaml
-      cluster/
-        memberstatuses/
-          ...
-```
+```sh
+talos-fuse \
+  --talosconfig $HOME/.talos/config \
+  --context my-cluster \
+  --nodes 10.0.0.2 \
+  --sync \
+  --mount ./mnt
 
-When more than one node is supplied via `--nodes`, the `/nodes`
-directory simply contains one entry per node:
-
-```
-mnt/
-  nodes/
-    node-a/
-      ...
-    node-b/
-      ...
+# edit and save
+$EDITOR mnt/nodes/my-node/network/addressstatuses/eth0.yaml
 ```
 
-Each per-node directory is independent; the node name is forwarded to the
-COSI repository so that listings and reads are scoped to the right node.
+The file is validated against the resource metadata before the write is
+sent; mismatches in namespace, type, or ID return `EINVAL`.
+
+### Resource ID escaping
+
+Resource IDs that contain a `/` character (common in Kubernetes-style
+names) are rendered with `/` replaced by `+` in filenames. For example, a
+resource with ID `kube-system/coredns` appears as
+`kube-system+coredns.yaml`. This is reversed transparently when the path
+is resolved.
 
 ## Flags
 
-| Flag              | Shorthand | Default | Description                                       |
-|-------------------|-----------|---------|---------------------------------------------------|
-| `--mount`         | `-m`      | `./`    | Mount point path                                  |
-| `--nodes`         | `-n`      | _none_  | Target nodes, comma-separated                     |
-| `--endpoints`     | `-e`      | _none_  | Override endpoints, comma-separated               |
-| `--talosconfig`   |           | _none_  | Path to `talosconfig`                             |
-| `--context`       |           | _none_  | `talosconfig` context name                        |
-| `--cluster`       |           | _none_  | Cluster name                                      |
-| `--maintenance`   | `-i`      | `false` | Connect in maintenance mode (insecure TLS)        |
-| `--sync`          | `-s`      | `false` | Enable two-way sync; resource writes flush back   |
-| `--format`        |           | `yaml`  | File format: `yaml` or `json`                     |
-| `--debug`         |           | `false` | Enable FUSE debug logging                         |
+| Flag            | Short | Default  | Description                                                  |
+|-----------------|-------|----------|--------------------------------------------------------------|
+| `--mount`       | `-m`  | `./`     | Mount point path                                             |
+| `--nodes`       | `-n`  | _none_   | Target nodes, comma-separated                                |
+| `--endpoints`   | `-e`  | _none_   | Override endpoints, comma-separated                          |
+| `--talosconfig` |       | _none_   | Path to `talosconfig` (defaults to `$HOME/.talos/config`)   |
+| `--context`     |       | _none_   | `talosconfig` context name (defaults to current context)     |
+| `--cluster`     |       | _none_   | Cluster name (required for Omni-managed clusters)            |
+| `--maintenance` | `-i`  | `false`  | Connect in maintenance mode (insecure TLS)                   |
+| `--sync`        | `-s`  | `false`  | Enable two-way sync; resource writes flush back via COSI     |
+| `--format`      |       | `yaml`   | File format: `yaml` or `json`                                |
+| `--cache-ttl`   |       | `5m`     | TTL for cached resource definitions and listings             |
+| `--debug`       |       | `false`  | Enable FUSE debug logging                                    |
 
-`--sync` is implicitly disabled in maintenance mode.
+`--sync` is implicitly disabled in maintenance mode and blocked for
+Omni-managed clusters.
 
 ## Tests
 
 ```sh
 go test ./...
 ```
+
+Unit tests cover the FUSE tree structure, multi-node layout, resource ID
+escaping, write-back validation, TTL caching, and Omni context detection.
+Integration tests (prefixed `TestMount_`) mount a real in-process FUSE
+filesystem and exercise end-to-end read and write paths.

@@ -46,7 +46,7 @@ changelog:
 
 release:
   github:
-    owner: jgarr
+    owner: rothgar
     name: talos-fuse
   draft: false
   prerelease: auto
