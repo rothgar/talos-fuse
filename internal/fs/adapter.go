@@ -76,7 +76,7 @@ func (a *RepositoryAdapter) ListResources(
 				return err
 			}
 
-			list, err := a.Repo.ListResources(ctx, c, node, namespace, rd)
+			list, err := a.Repo.ListResources(ctx, c, namespace, rd)
 			if err != nil {
 				return err
 			}
@@ -110,7 +110,7 @@ func (a *RepositoryAdapter) GetResource(
 				return err
 			}
 
-			r, err := a.Repo.GetResource(ctx, c, node, namespace, id, rd)
+			r, err := a.Repo.GetResource(ctx, c, namespace, id, rd)
 			if err != nil {
 				return err
 			}
@@ -140,6 +140,6 @@ func (a *RepositoryAdapter) UpdateResource(
 			if node != "" {
 				ctx = client.WithNode(ctx, node)
 			}
-			return a.Repo.UpdateResource(ctx, c, node, rsrc)
+			return a.Repo.UpdateResource(ctx, c, rsrc)
 		})
 }

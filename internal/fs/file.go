@@ -152,19 +152,15 @@ func metadataMatchesFile(r *protobuf.Resource, f *resourceFile) bool {
 }
 
 // mapFlushError converts repository/parse errors to syscall.Errno values.
-//
-//	permission / read-only -> EPERM
-//	conflict / invalid   -> EINVAL
-//	other                -> EIO
+// Conflict and validation errors map to EINVAL; permission errors to EPERM;
+// gRPC status errors are translated by grpcErrno.
 func mapFlushError(err error) syscall.Errno {
 	if err == nil {
 		return 0
 	}
 
 	switch {
-	case errors.Is(err, syscall.EACCES), errors.Is(err, syscall.EROFS):
-		return syscall.EPERM
-	case errors.Is(err, syscall.EPERM):
+	case errors.Is(err, syscall.EACCES), errors.Is(err, syscall.EROFS), errors.Is(err, syscall.EPERM):
 		return syscall.EPERM
 	case errors.Is(err, syscall.EINVAL):
 		return syscall.EINVAL
@@ -174,7 +170,7 @@ func mapFlushError(err error) syscall.Errno {
 		return syscall.EINVAL
 	}
 
-	return syscall.EIO
+	return grpcErrno(err)
 }
 
 // invalidateContent resets the cached read buffer for the file so that

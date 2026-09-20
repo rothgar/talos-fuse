@@ -3,7 +3,6 @@ package fs
 import (
 	"context"
 	"errors"
-	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -30,18 +29,22 @@ const fileModeRO = 0o444
 // fileModeRW is the mode used for writable files: 0644.
 const fileModeRW = 0o644
 
-// entryTimeout is the attribute/entry timeout used for cached lookups.
-// A zero value forces the kernel to revalidate attributes on every
-// access, which keeps reported file sizes accurate (the size is filled
-// in lazily by resourceFile.Getattr).
-var entryTimeout = time.Duration(0)
+// dirTimeout is the attribute/entry timeout for directory inodes. The
+// kernel caches namespace and resource-type listings for this duration,
+// avoiding a FUSE round-trip on every stat or traversal step.
+var dirTimeout = 30 * time.Second
+
+// fileAttrTimeout is the attribute timeout for file inodes. Kept short
+// so that file sizes reported by stat stay reasonably fresh; content is
+// fetched eagerly at Open time so reads are unaffected.
+var fileAttrTimeout = 5 * time.Second
 
 // ----- TalosRoot (root directory) -----
 
 // Getattr implements fs.NodeGetattrer.
 func (r *TalosRoot) Getattr(_ context.Context, _ gfuse.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = dirMode
-	out.SetTimeout(entryTimeout)
+	out.SetTimeout(dirTimeout)
 	return 0
 }
 
@@ -71,7 +74,8 @@ func (r *TalosRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 		labels: buildNodeLabels(r.opts.Nodes, r.opts.NodeLabels),
 	}, stable)
 	out.Attr.Mode = dirMode
-	out.SetAttrTimeout(entryTimeout)
+	out.SetAttrTimeout(dirTimeout)
+	out.SetEntryTimeout(dirTimeout)
 
 	return child, 0
 }
@@ -115,7 +119,7 @@ func buildNodeLabels(nodes []string, nodeLabels map[string]string) map[string]st
 // Getattr implements fs.NodeGetattrer.
 func (n *nodeDir) Getattr(_ context.Context, _ gfuse.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = dirMode
-	out.SetTimeout(entryTimeout)
+	out.SetTimeout(dirTimeout)
 	return 0
 }
 
@@ -136,7 +140,8 @@ func (n *nodeDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (
 	stable := gfuse.StableAttr{Mode: fuse.S_IFDIR}
 	child := n.NewInode(ctx, &perNodeDir{opts: n.opts, name: nodeID, defs: defs}, stable)
 	out.Attr.Mode = dirMode
-	out.SetAttrTimeout(entryTimeout)
+	out.SetAttrTimeout(dirTimeout)
+	out.SetEntryTimeout(dirTimeout)
 
 	return child, 0
 }
@@ -171,7 +176,7 @@ type perNodeDir struct {
 // Getattr implements fs.NodeGetattrer.
 func (n *perNodeDir) Getattr(_ context.Context, _ gfuse.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = dirMode
-	out.SetTimeout(entryTimeout)
+	out.SetTimeout(dirTimeout)
 	return 0
 }
 
@@ -186,19 +191,49 @@ func (n *perNodeDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut
 	stable := gfuse.StableAttr{Mode: fuse.S_IFDIR}
 	child := n.NewInode(ctx, &namespaceDir{opts: n.opts, namespace: name, defs: n.defs, node: n.name}, stable)
 	out.Attr.Mode = dirMode
-	out.SetAttrTimeout(entryTimeout)
+	out.SetAttrTimeout(dirTimeout)
+	out.SetEntryTimeout(dirTimeout)
 
 	return child, 0
 }
 
-// Readdir lists the namespace directories for this node.
+// Readdir lists the namespace directories for this node and kicks off a
+// background pre-warm of the ListResources cache for every resource type
+// on this node. This means a subsequent recursive tree walk (e.g. eza -T)
+// finds warm cache entries instead of blocking on sequential API calls.
 func (n *perNodeDir) Readdir(_ context.Context) (gfuse.DirStream, syscall.Errno) {
 	names := namespaceNames(n.defs)
 	entries := make([]fuse.DirEntry, 0, len(names))
 	for _, nm := range names {
 		entries = append(entries, fuse.DirEntry{Name: nm, Mode: fuse.S_IFDIR})
 	}
+	go prefetchNodeLists(context.Background(), n.opts.Repository, n.name, n.defs)
 	return gfuse.NewListDirStream(entries), 0
+}
+
+// prefetchNodeLists warms the ListResources cache for every resource type
+// defined on node, running up to prefetchConcurrency calls in parallel.
+// Errors are silently dropped; a cache miss on the subsequent real access
+// is the correct fallback.
+const prefetchConcurrency = 8
+
+func prefetchNodeLists(ctx context.Context, repo ResourceRepository, node string, defs []*meta.ResourceDefinition) {
+	sem := make(chan struct{}, prefetchConcurrency)
+	var wg sync.WaitGroup
+	for _, rd := range defs {
+		ns := rd.TypedSpec().DefaultNamespace
+		if ns == "" {
+			continue
+		}
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(namespace, resourceType string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			_, _ = repo.ListResources(ctx, node, namespace, resourceType)
+		}(ns, string(rd.TypedSpec().Type))
+	}
+	wg.Wait()
 }
 
 // ----- namespaceDir -----
@@ -215,7 +250,7 @@ type namespaceDir struct {
 // Getattr implements fs.NodeGetattrer.
 func (n *namespaceDir) Getattr(_ context.Context, _ gfuse.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = dirMode
-	out.SetTimeout(entryTimeout)
+	out.SetTimeout(dirTimeout)
 	return 0
 }
 
@@ -269,7 +304,8 @@ func (n *namespaceDir) Lookup(ctx context.Context, name string, out *fuse.EntryO
 		rd:        rd,
 	}, stable)
 	out.Attr.Mode = dirMode
-	out.SetAttrTimeout(entryTimeout)
+	out.SetAttrTimeout(dirTimeout)
+	out.SetEntryTimeout(dirTimeout)
 
 	return child, 0
 }
@@ -300,7 +336,7 @@ type resourceTypeDir struct {
 // Getattr implements fs.NodeGetattrer.
 func (r *resourceTypeDir) Getattr(_ context.Context, _ gfuse.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = dirMode
-	out.SetTimeout(entryTimeout)
+	out.SetTimeout(dirTimeout)
 	return 0
 }
 
@@ -312,10 +348,7 @@ func (r *resourceTypeDir) Lookup(ctx context.Context, name string, out *fuse.Ent
 		return nil, syscall.ENOENT
 	}
 
-	id, err := url.PathUnescape(idRaw)
-	if err != nil {
-		return nil, syscall.EINVAL
-	}
+	id := unescapeID(idRaw)
 
 	rf := &resourceFile{
 		opts:      r.opts,
@@ -330,17 +363,21 @@ func (r *resourceTypeDir) Lookup(ctx context.Context, name string, out *fuse.Ent
 	child := r.NewInode(ctx, rf, stable)
 
 	out.Attr.Mode = fileMode(r.opts.Writeable && !r.opts.Maintenance)
-	// We don't know the size until we fetch; leave zero, the kernel
-	// will re-stat on the first read.
-	out.SetAttrTimeout(entryTimeout)
+	out.SetAttrTimeout(fileAttrTimeout)
+	out.SetEntryTimeout(dirTimeout)
 
 	return child, 0
 }
 
-// Readdir lists resource files within this type directory.
+// Readdir lists resource files within this type directory. Permission-denied
+// errors are treated as empty directories so recursive tree walks skip them
+// cleanly rather than reporting an error for every restricted type.
 func (r *resourceTypeDir) Readdir(ctx context.Context) (gfuse.DirStream, syscall.Errno) {
 	items, err := r.opts.Repository.ListResources(ctx, r.node, r.namespace, r.rd.TypedSpec().Type)
 	if err != nil {
+		if grpcErrno(err) == syscall.EACCES {
+			return gfuse.NewListDirStream(nil), 0
+		}
 		return nil, grpcErrno(err)
 	}
 
@@ -349,7 +386,7 @@ func (r *resourceTypeDir) Readdir(ctx context.Context) (gfuse.DirStream, syscall
 	for _, item := range items {
 		id := item.Metadata().ID()
 		entries = append(entries, fuse.DirEntry{
-			Name: url.PathEscape(string(id)) + ext,
+			Name: escapeID(string(id)) + ext,
 			Mode: fuse.S_IFREG,
 		})
 	}
@@ -393,7 +430,7 @@ func (f *resourceFile) Getattr(_ context.Context, _ gfuse.FileHandle, out *fuse.
 	f.contentMu.Lock()
 	out.Size = uint64(len(f.content))
 	f.contentMu.Unlock()
-	out.SetTimeout(entryTimeout)
+	out.SetTimeout(fileAttrTimeout)
 	return 0
 }
 
@@ -415,26 +452,27 @@ func (f *resourceFile) Setattr(_ context.Context, _ gfuse.FileHandle, in *fuse.S
 		f.invalidateContent()
 	}
 
-	out.Mode = fileMode(true)
+	out.Mode = fileMode(f.opts.Writeable && !f.opts.Maintenance)
 	out.Size = in.Size
-	out.SetTimeout(entryTimeout)
+	out.SetTimeout(fileAttrTimeout)
 
 	return 0
 }
 
-// Open implements fs.NodeOpener. A fresh fileHandle is allocated; the
-// content is fetched lazily so Open itself is cheap.
-// FOPEN_DIRECT_IO tells the kernel to bypass the page cache and always
-// forward reads to FUSE. This lets Getattr return size 0 for uncached
-// files without the kernel short-circuiting reads based on that hint.
+// Open implements fs.NodeOpener. FOPEN_DIRECT_IO tells the kernel to
+// bypass its page cache and always forward reads to FUSE. This is
+// required because Lookup returns size=0 (content is unknown until
+// fetched), and without DIRECT_IO the kernel would short-circuit all
+// reads against that cached zero size.
 func (f *resourceFile) Open(_ context.Context, _ uint32) (gfuse.FileHandle, uint32, syscall.Errno) {
-	return &fileHandle{file: f, mu: sync.Mutex{}}, fuse.FOPEN_DIRECT_IO, 0
+	return &fileHandle{file: f}, fuse.FOPEN_DIRECT_IO, 0
 }
 
-// Read implements fs.NodeReader. It fetches the resource content via
-// the repository on first read and caches the result.
-func (f *resourceFile) Read(_ context.Context, _ gfuse.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	data, err := f.fetch()
+// Read implements fs.NodeReader. It fetches the resource on first access
+// and caches the result; subsequent reads within the same inode lifetime
+// are served from memory.
+func (f *resourceFile) Read(ctx context.Context, _ gfuse.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
+	data, err := f.fetch(ctx)
 	if err != nil {
 		return nil, grpcErrno(err)
 	}
@@ -454,29 +492,17 @@ func (f *resourceFile) Read(_ context.Context, _ gfuse.FileHandle, dest []byte, 
 	return fuse.ReadResultData(data[off:end]), 0
 }
 
-// Write implements fs.NodeWriter. The actual buffering is performed by
-// the per-open fileHandle; here we simply forward so the writability
-// checks and error mapping are applied consistently.
+// Write implements fs.NodeWriter. Buffering is handled by the per-open
+// fileHandle returned from Open; this just forwards to it.
 func (f *resourceFile) Write(ctx context.Context, h gfuse.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
-	if h == nil {
-		return 0, syscall.EIO
-	}
-
 	if fh, ok := h.(*fileHandle); ok {
 		return fh.Write(ctx, data, off)
-	}
-
-	if f.opts.Maintenance {
-		return 0, syscall.EROFS
-	}
-	if !f.opts.Writeable {
-		return 0, syscall.EACCES
 	}
 	return 0, syscall.EIO
 }
 
 // fetch retrieves (and caches) the formatted file content.
-func (f *resourceFile) fetch() ([]byte, error) {
+func (f *resourceFile) fetch(ctx context.Context) ([]byte, error) {
 	f.contentMu.Lock()
 	defer f.contentMu.Unlock()
 
@@ -484,7 +510,7 @@ func (f *resourceFile) fetch() ([]byte, error) {
 		return f.content, f.contentErr
 	}
 
-	rsrc, err := f.opts.Repository.GetResource(context.Background(), f.node, f.namespace, f.rd.TypedSpec().Type, f.id)
+	rsrc, err := f.opts.Repository.GetResource(ctx, f.node, f.namespace, f.rd.TypedSpec().Type, f.id)
 	if err != nil {
 		f.contentErr = err
 		return nil, err

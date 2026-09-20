@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -163,31 +164,42 @@ func isOmniContext(talosconfig, contextName string) (bool, error) {
 }
 
 // resolveNodeHostnames fetches HostnameStatuses/hostname from each node
-// and returns a map of nodeID → hostname. Nodes that cannot be reached or
-// whose hostname cannot be parsed are omitted (the UUID is used instead).
+// in parallel and returns a map of nodeID → hostname. Nodes that cannot
+// be reached or whose hostname cannot be parsed are omitted (the UUID
+// is used instead).
 func resolveNodeHostnames(ctx context.Context, adapter *fs.RepositoryAdapter, nodes []string) map[string]string {
+	var mu sync.Mutex
 	labels := make(map[string]string, len(nodes))
+
+	var wg sync.WaitGroup
 	for _, nodeID := range nodes {
-		rsrc, err := adapter.GetResource(ctx, nodeID, "network", "HostnameStatuses.net.talos.dev", "hostname")
-		if err != nil {
-			continue
-		}
-		yamlBytes, err := resourceutil.FormatResource(rsrc, "yaml")
-		if err != nil {
-			continue
-		}
-		var doc struct {
-			Spec struct {
-				Hostname string `yaml:"hostname"`
-			} `yaml:"spec"`
-		}
-		if err := yaml.Unmarshal(yamlBytes, &doc); err != nil {
-			continue
-		}
-		if doc.Spec.Hostname != "" {
-			labels[nodeID] = doc.Spec.Hostname
-		}
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			rsrc, err := adapter.GetResource(ctx, id, "network", "HostnameStatuses.net.talos.dev", "hostname")
+			if err != nil {
+				return
+			}
+			yamlBytes, err := resourceutil.FormatResource(rsrc, "yaml")
+			if err != nil {
+				return
+			}
+			var doc struct {
+				Spec struct {
+					Hostname string `yaml:"hostname"`
+				} `yaml:"spec"`
+			}
+			if err := yaml.Unmarshal(yamlBytes, &doc); err != nil {
+				return
+			}
+			if doc.Spec.Hostname != "" {
+				mu.Lock()
+				labels[id] = doc.Spec.Hostname
+				mu.Unlock()
+			}
+		}(nodeID)
 	}
+	wg.Wait()
 	return labels
 }
 

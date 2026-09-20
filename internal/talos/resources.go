@@ -43,23 +43,19 @@ func (r *Repository) ResolveResourceKind(
 	return rd, nil
 }
 
-// ListResources lists every resource of rd's type under namespace. When
-// node is non-empty the request is scoped to a single node via
-// client.WithNode. The protobuf unmarshaler is skipped so the returned
-// resources carry their typed specs without needing client-side
-// registration of every Talos resource type.
+// ListResources lists every resource of rd's type under namespace. The
+// caller is responsible for scoping ctx to the target node via
+// client.WithNode before calling. The protobuf unmarshaler is skipped
+// so the returned resources carry their typed specs without needing
+// client-side registration of every Talos resource type.
 func (r *Repository) ListResources(
 	ctx context.Context,
 	c *client.Client,
-	node, namespace string,
+	namespace string,
 	rd *meta.ResourceDefinition,
 ) ([]resource.Resource, error) {
 	if rd == nil {
 		return nil, fmt.Errorf("resource definition is nil")
-	}
-
-	if node != "" {
-		ctx = client.WithNode(ctx, node)
 	}
 
 	list, err := c.COSI.List(
@@ -76,21 +72,17 @@ func (r *Repository) ListResources(
 	return items, nil
 }
 
-// GetResource fetches a single resource by namespace and id. When node
-// is non-empty the request is scoped via client.WithNode. The protobuf
-// unmarshaler is skipped for the same reason as ListResources.
+// GetResource fetches a single resource by namespace and id. The caller
+// is responsible for scoping ctx to the target node before calling.
+// The protobuf unmarshaler is skipped for the same reason as ListResources.
 func (r *Repository) GetResource(
 	ctx context.Context,
 	c *client.Client,
-	node, namespace, id string,
+	namespace, id string,
 	rd *meta.ResourceDefinition,
 ) (resource.Resource, error) {
 	if rd == nil {
 		return nil, fmt.Errorf("resource definition is nil")
-	}
-
-	if node != "" {
-		ctx = client.WithNode(ctx, node)
 	}
 
 	rsrc, err := c.COSI.Get(
@@ -104,20 +96,15 @@ func (r *Repository) GetResource(
 	return rsrc, nil
 }
 
-// UpdateResource writes a resource back to the API. When node is
-// non-empty the request is scoped via client.WithNode.
+// UpdateResource writes a resource back to the API. The caller is
+// responsible for scoping ctx to the target node before calling.
 func (r *Repository) UpdateResource(
 	ctx context.Context,
 	c *client.Client,
-	node string,
 	rsrc resource.Resource,
 ) error {
 	if rsrc == nil {
 		return fmt.Errorf("resource is nil")
-	}
-
-	if node != "" {
-		ctx = client.WithNode(ctx, node)
 	}
 
 	if err := c.COSI.Update(ctx, rsrc); err != nil {
