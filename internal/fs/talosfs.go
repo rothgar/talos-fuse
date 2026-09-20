@@ -1,7 +1,9 @@
 // Package fs implements the FUSE filesystem exposing Talos COSI
 // resources as a directory tree. The tree layout is:
 //
-//	/nodes/<node>/<namespace>/<resource-type>/<id>.<ext>
+//	/<cluster>/<node>/<namespace>/<resource-type>/<id>.<ext>
+//
+// where <cluster> is Options.Cluster when set, or "nodes" when unset.
 //
 // The filesystem is read-only by default. When Options.Writeable is
 // true the file handles become writable and flush back through
@@ -31,9 +33,16 @@ type Options struct {
 	Writeable bool
 	// Format is "yaml" or "json"; controls file extension and content.
 	Format string
-	// Nodes is the set of target nodes. The tree always uses the
-	// /nodes/<node>/ prefix, even when only a single node is targeted.
+	// Nodes is the set of target nodes.
 	Nodes []string
+	// Cluster, when non-empty, is used as the name of the top-level
+	// directory in the mounted tree instead of the default "nodes".
+	Cluster string
+	// NodeLabels maps each node ID (UUID or IP) to a human-readable
+	// display name used as the directory name in the tree. When a node
+	// has no entry here its ID is used unchanged. COSI calls always use
+	// the original ID regardless of the label.
+	NodeLabels map[string]string
 	// MountOptions, when non-zero, provides FUSE mount options that
 	// override the defaults (notably the Debug flag and FsName).
 	MountOptions fuse.MountOptions
@@ -43,8 +52,9 @@ type Options struct {
 // unit tested with a fake implementation.
 type ResourceRepository interface {
 	// ResourceDefinitions returns the resource definitions advertised
-	// by the connected node(s).
-	ResourceDefinitions(ctx context.Context) ([]*meta.ResourceDefinition, error)
+	// by the given node. node must be non-empty when the backend routes
+	// through a proxy (e.g. Omni) that requires per-node addressing.
+	ResourceDefinitions(ctx context.Context, node string) ([]*meta.ResourceDefinition, error)
 	// ListResources returns the resources of resourceType under
 	// namespace on node. node may be empty to address the multi-node
 	// repository.

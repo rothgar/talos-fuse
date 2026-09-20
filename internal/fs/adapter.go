@@ -31,13 +31,17 @@ type RepositoryAdapter struct {
 }
 
 // ResourceDefinitions implements ResourceRepository by delegating to
-// the underlying Talos Repository. The returned slice is safe to
-// iterate concurrently.
-func (a *RepositoryAdapter) ResourceDefinitions(ctx context.Context) ([]*meta.ResourceDefinition, error) {
+// the underlying Talos Repository. When node is non-empty the request
+// is scoped to that node via client.WithNode so that proxies (e.g.
+// Omni) can route the call correctly.
+func (a *RepositoryAdapter) ResourceDefinitions(ctx context.Context, node string) ([]*meta.ResourceDefinition, error) {
 	var defs []*meta.ResourceDefinition
 
 	err := a.Repo.WithClient(ctx, a.Talosconfig, a.ContextName, a.Cluster,
 		func(ctx context.Context, c *client.Client) error {
+			if node != "" {
+				ctx = client.WithNode(ctx, node)
+			}
 			d, err := a.Repo.ResourceDefinitions(ctx, c)
 			if err != nil {
 				return err

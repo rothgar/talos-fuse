@@ -70,7 +70,7 @@ func newFakeRepo(t *testing.T) *fakeRepo {
 	}
 }
 
-func (f *fakeRepo) ResourceDefinitions(_ context.Context) ([]*meta.ResourceDefinition, error) {
+func (f *fakeRepo) ResourceDefinitions(_ context.Context, _ string) ([]*meta.ResourceDefinition, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]*meta.ResourceDefinition, len(f.defs))

@@ -2,6 +2,7 @@ package fs
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"sort"
 	"strings"
@@ -11,6 +12,8 @@ import (
 
 	gfuse "github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/cosi-project/runtime/pkg/resource"
 	"github.com/cosi-project/runtime/pkg/resource/meta"
@@ -42,15 +45,31 @@ func (r *TalosRoot) Getattr(_ context.Context, _ gfuse.FileHandle, out *fuse.Att
 	return 0
 }
 
+// topLevelName returns the name of the single top-level directory
+// exposed by the root. When a cluster name is configured it is used
+// so that the tree reads as /<cluster>/<node>/...; otherwise the
+// legacy "nodes" name is used.
+func (r *TalosRoot) topLevelName() string {
+	if r.opts.Cluster != "" {
+		return r.opts.Cluster
+	}
+	return "nodes"
+}
+
 // Lookup implements fs.NodeLookuper. The root always contains a single
-// "nodes" directory whose children are the per-node directories.
+// directory (the cluster name or "nodes") whose children are the
+// per-node directories.
 func (r *TalosRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*gfuse.Inode, syscall.Errno) {
-	if name != "nodes" {
+	if name != r.topLevelName() {
 		return nil, syscall.ENOENT
 	}
 
 	stable := gfuse.StableAttr{Mode: fuse.S_IFDIR}
-	child := r.NewInode(ctx, &nodeDir{opts: r.opts, nodes: append([]string(nil), r.opts.Nodes...)}, stable)
+	child := r.NewInode(ctx, &nodeDir{
+		opts:   r.opts,
+		nodes:  append([]string(nil), r.opts.Nodes...),
+		labels: buildNodeLabels(r.opts.Nodes, r.opts.NodeLabels),
+	}, stable)
 	out.Attr.Mode = dirMode
 	out.SetAttrTimeout(entryTimeout)
 
@@ -58,10 +77,10 @@ func (r *TalosRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 }
 
 // Readdir implements fs.NodeReaddirer. The root always contains a
-// single "nodes" directory.
+// single directory entry (the cluster name or "nodes").
 func (r *TalosRoot) Readdir(_ context.Context) (gfuse.DirStream, syscall.Errno) {
 	return gfuse.NewListDirStream([]fuse.DirEntry{
-		{Name: "nodes", Mode: fuse.S_IFDIR},
+		{Name: r.topLevelName(), Mode: fuse.S_IFDIR},
 	}), 0
 }
 
@@ -71,8 +90,26 @@ func (r *TalosRoot) Readdir(_ context.Context) (gfuse.DirStream, syscall.Errno) 
 // directories, one for each configured node.
 type nodeDir struct {
 	gfuse.Inode
-	opts  Options
-	nodes []string
+	opts   Options
+	nodes  []string          // node IDs in original order (used for routing)
+	labels map[string]string // display name → node ID
+}
+
+// buildNodeLabels constructs the display-name → node-ID map for nodeDir.
+// When nodeLabels maps a node ID to a non-empty label that label is used
+// as the directory name; otherwise the node ID is used unchanged.
+func buildNodeLabels(nodes []string, nodeLabels map[string]string) map[string]string {
+	m := make(map[string]string, len(nodes))
+	for _, id := range nodes {
+		name := id
+		if nodeLabels != nil {
+			if label, ok := nodeLabels[id]; ok && label != "" {
+				name = label
+			}
+		}
+		m[name] = id
+	}
+	return m
 }
 
 // Getattr implements fs.NodeGetattrer.
@@ -82,38 +119,40 @@ func (n *nodeDir) Getattr(_ context.Context, _ gfuse.FileHandle, out *fuse.AttrO
 	return 0
 }
 
-// Lookup resolves a per-node directory by name. The name must match
-// one of the configured nodes; otherwise ENOENT is returned.
+// Lookup resolves a per-node directory by display name. The display name
+// is translated back to the node ID via the labels map so that COSI calls
+// always use the original ID regardless of what label is shown on disk.
 func (n *nodeDir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*gfuse.Inode, syscall.Errno) {
-	found := false
-	for _, candidate := range n.nodes {
-		if candidate == name {
-			found = true
-			break
-		}
-	}
-	if !found {
+	nodeID, ok := n.labels[name]
+	if !ok {
 		return nil, syscall.ENOENT
 	}
 
-	defs, err := n.opts.Repository.ResourceDefinitions(ctx)
+	defs, err := n.opts.Repository.ResourceDefinitions(ctx, nodeID)
 	if err != nil {
-		return nil, syscall.EIO
+		return nil, grpcErrno(err)
 	}
 
 	stable := gfuse.StableAttr{Mode: fuse.S_IFDIR}
-	child := n.NewInode(ctx, &perNodeDir{opts: n.opts, name: name, defs: defs}, stable)
+	child := n.NewInode(ctx, &perNodeDir{opts: n.opts, name: nodeID, defs: defs}, stable)
 	out.Attr.Mode = dirMode
 	out.SetAttrTimeout(entryTimeout)
 
 	return child, 0
 }
 
-// Readdir lists the configured node names as directories.
+// Readdir lists node display names as directories. The order follows the
+// original Nodes slice so that the listing is stable across calls.
 func (n *nodeDir) Readdir(_ context.Context) (gfuse.DirStream, syscall.Errno) {
 	entries := make([]fuse.DirEntry, 0, len(n.nodes))
-	for _, name := range n.nodes {
-		entries = append(entries, fuse.DirEntry{Name: name, Mode: fuse.S_IFDIR})
+	for _, id := range n.nodes {
+		displayName := id
+		if nl := n.opts.NodeLabels; nl != nil {
+			if label, ok := nl[id]; ok && label != "" {
+				displayName = label
+			}
+		}
+		entries = append(entries, fuse.DirEntry{Name: displayName, Mode: fuse.S_IFDIR})
 	}
 	return gfuse.NewListDirStream(entries), 0
 }
@@ -302,7 +341,7 @@ func (r *resourceTypeDir) Lookup(ctx context.Context, name string, out *fuse.Ent
 func (r *resourceTypeDir) Readdir(ctx context.Context) (gfuse.DirStream, syscall.Errno) {
 	items, err := r.opts.Repository.ListResources(ctx, r.node, r.namespace, r.rd.TypedSpec().Type)
 	if err != nil {
-		return nil, syscall.EIO
+		return nil, grpcErrno(err)
 	}
 
 	ext := fileExtensionFor(r.opts.Format)
@@ -344,24 +383,17 @@ func fileMode(writeable bool) uint32 {
 	return fileModeRO
 }
 
-// Getattr implements fs.NodeGetattrer. The size is filled in lazily
-// by triggering a fetch on first stat.
+// Getattr implements fs.NodeGetattrer. Size is reported from the cached
+// content if available; otherwise 0 is returned and the kernel re-stats
+// after the first Read populates the cache. Triggering a fetch here
+// would make every directory traversal (e.g. eza -T) issue a GetResource
+// call per file, which is prohibitively expensive over a remote API.
 func (f *resourceFile) Getattr(_ context.Context, _ gfuse.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	out.Mode = fileMode(f.opts.Writeable && !f.opts.Maintenance)
 	f.contentMu.Lock()
-	haveContent := f.content != nil || f.contentErr != nil
-	size := len(f.content)
+	out.Size = uint64(len(f.content))
 	f.contentMu.Unlock()
-	out.Size = uint64(size)
 	out.SetTimeout(entryTimeout)
-
-	if !haveContent {
-		_, _ = f.fetch()
-		f.contentMu.Lock()
-		out.Size = uint64(len(f.content))
-		f.contentMu.Unlock()
-	}
-
 	return 0
 }
 
@@ -392,8 +424,11 @@ func (f *resourceFile) Setattr(_ context.Context, _ gfuse.FileHandle, in *fuse.S
 
 // Open implements fs.NodeOpener. A fresh fileHandle is allocated; the
 // content is fetched lazily so Open itself is cheap.
+// FOPEN_DIRECT_IO tells the kernel to bypass the page cache and always
+// forward reads to FUSE. This lets Getattr return size 0 for uncached
+// files without the kernel short-circuiting reads based on that hint.
 func (f *resourceFile) Open(_ context.Context, _ uint32) (gfuse.FileHandle, uint32, syscall.Errno) {
-	return &fileHandle{file: f, mu: sync.Mutex{}}, 0, 0
+	return &fileHandle{file: f, mu: sync.Mutex{}}, fuse.FOPEN_DIRECT_IO, 0
 }
 
 // Read implements fs.NodeReader. It fetches the resource content via
@@ -401,7 +436,7 @@ func (f *resourceFile) Open(_ context.Context, _ uint32) (gfuse.FileHandle, uint
 func (f *resourceFile) Read(_ context.Context, _ gfuse.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	data, err := f.fetch()
 	if err != nil {
-		return nil, syscall.EIO
+		return nil, grpcErrno(err)
 	}
 
 	if off < 0 {
@@ -537,6 +572,30 @@ var (
 	_ gfuse.NodeReader    = (*resourceFile)(nil)
 	_ gfuse.NodeWriter    = (*resourceFile)(nil)
 )
+
+// grpcErrno translates a (possibly wrapped) gRPC status error into the
+// most appropriate syscall.Errno for reporting through FUSE. Walking the
+// error chain is necessary because the repository layers wrap errors with
+// fmt.Errorf before returning them.
+func grpcErrno(err error) syscall.Errno {
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		s, ok := status.FromError(e)
+		if !ok {
+			continue
+		}
+		switch s.Code() {
+		case codes.PermissionDenied, codes.Unauthenticated:
+			return syscall.EACCES
+		case codes.NotFound:
+			return syscall.ENOENT
+		case codes.Unimplemented:
+			return syscall.ENOSYS
+		default:
+			return syscall.EIO
+		}
+	}
+	return syscall.EIO
+}
 
 // ensure resource package import remains in scope even if individual
 // helpers are reorganised later.

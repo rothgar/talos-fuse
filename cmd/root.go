@@ -2,13 +2,17 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/spf13/cobra"
+	"go.yaml.in/yaml/v4"
 
 	"github.com/jgarr/talos-fuse/internal/fs"
+	"github.com/jgarr/talos-fuse/internal/resourceutil"
 	"github.com/jgarr/talos-fuse/internal/talos"
 )
 
@@ -74,6 +78,11 @@ func RunE(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
+	cacheTTL, err := cmd.Flags().GetDuration("cache-ttl")
+	if err != nil {
+		return err
+	}
+
 	repo := talos.NewRepository(maintenance, nodes, endpoints)
 
 	effectiveNodes, err := repo.ResolveNodes(talosconfig, contextName)
@@ -88,12 +97,25 @@ func RunE(cmd *cobra.Command, _ []string) error {
 		Cluster:     cluster,
 	}
 
+	// Resolve each node UUID to its hostname so directory listings show
+	// meaningful names. Failures are non-fatal: the UUID is used instead.
+	nodeLabels := resolveNodeHostnames(context.Background(), adapter, effectiveNodes)
+
+	// Wrap the adapter with a TTL cache and pre-warm ResourceDefinitions
+	// for all nodes so the first directory listing is served from memory.
+	cached := fs.NewCachingRepository(adapter, cacheTTL)
+	if !maintenance {
+		cached.Prefetch(context.Background(), effectiveNodes)
+	}
+
 	fuseOpts := &fs.Options{
-		Repository:  adapter,
+		Repository:  cached,
 		Maintenance: maintenance,
 		Writeable:   syncFlag && !maintenance,
 		Format:      format,
 		Nodes:       effectiveNodes,
+		Cluster:     cluster,
+		NodeLabels:  nodeLabels,
 		MountOptions: fuse.MountOptions{
 			Name:  "talos-fuse",
 			Debug: debug,
@@ -107,6 +129,35 @@ func RunE(cmd *cobra.Command, _ []string) error {
 
 	server.Wait()
 	return nil
+}
+
+// resolveNodeHostnames fetches HostnameStatuses/hostname from each node
+// and returns a map of nodeID → hostname. Nodes that cannot be reached or
+// whose hostname cannot be parsed are omitted (the UUID is used instead).
+func resolveNodeHostnames(ctx context.Context, adapter *fs.RepositoryAdapter, nodes []string) map[string]string {
+	labels := make(map[string]string, len(nodes))
+	for _, nodeID := range nodes {
+		rsrc, err := adapter.GetResource(ctx, nodeID, "network", "HostnameStatuses.net.talos.dev", "hostname")
+		if err != nil {
+			continue
+		}
+		yamlBytes, err := resourceutil.FormatResource(rsrc, "yaml")
+		if err != nil {
+			continue
+		}
+		var doc struct {
+			Spec struct {
+				Hostname string `yaml:"hostname"`
+			} `yaml:"spec"`
+		}
+		if err := yaml.Unmarshal(yamlBytes, &doc); err != nil {
+			continue
+		}
+		if doc.Spec.Hostname != "" {
+			labels[nodeID] = doc.Spec.Hostname
+		}
+	}
+	return labels
 }
 
 var rootCmd = &cobra.Command{
@@ -136,4 +187,5 @@ func init() {
 	rootCmd.Flags().BoolP("sync", "s", false, "enable two-way sync (resource writes)")
 	rootCmd.Flags().String("format", "yaml", "file format: yaml or json")
 	rootCmd.Flags().Bool("debug", false, "enable FUSE debug logging")
+	rootCmd.Flags().Duration("cache-ttl", 5*time.Minute, "TTL for cached resource definitions and listings (0 to disable)")
 }
