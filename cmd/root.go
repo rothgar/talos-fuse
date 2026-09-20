@@ -9,6 +9,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/spf13/cobra"
+	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 	"go.yaml.in/yaml/v4"
 
 	"github.com/jgarr/talos-fuse/internal/fs"
@@ -83,6 +84,15 @@ func RunE(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
+	// Block --sync on Omni-managed clusters. Omni reconciles machine
+	// config through its own patch system; direct COSI writes bypass that
+	// and will be silently reverted on the next reconcile cycle.
+	if syncFlag && !maintenance {
+		if omni, err := isOmniContext(talosconfig, contextName); err == nil && omni {
+			return fmt.Errorf("--sync is not supported for Omni-managed clusters: writes bypass Omni's patch reconciliation and will be reverted; use omnictl or the Omni UI to apply configuration changes")
+		}
+	}
+
 	repo := talos.NewRepository(maintenance, nodes, endpoints)
 
 	effectiveNodes, err := repo.ResolveNodes(talosconfig, contextName)
@@ -129,6 +139,27 @@ func RunE(cmd *cobra.Command, _ []string) error {
 
 	server.Wait()
 	return nil
+}
+
+// isOmniContext reports whether the selected talosconfig context is
+// managed by Omni. Omni contexts carry a non-empty cluster field that
+// the Omni proxy uses for routing; direct Talos contexts do not set it.
+// Errors opening the talosconfig are returned so the caller can decide
+// whether to treat them as fatal.
+func isOmniContext(talosconfig, contextName string) (bool, error) {
+	cfg, err := clientconfig.Open(talosconfig)
+	if err != nil {
+		return false, err
+	}
+	name := contextName
+	if name == "" {
+		name = cfg.Context
+	}
+	ctx := cfg.Contexts[name]
+	if ctx == nil {
+		return false, nil
+	}
+	return ctx.Cluster != "", nil
 }
 
 // resolveNodeHostnames fetches HostnameStatuses/hostname from each node
